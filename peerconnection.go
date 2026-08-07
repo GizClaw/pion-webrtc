@@ -2459,6 +2459,8 @@ func (pc *PeerConnection) CreateDataChannel(label string, options *DataChannelIn
 	// If SCTP already connected open all the channels
 	if pc.sctpTransport.State() == SCTPTransportStateConnected {
 		if err = dataChannel.open(pc.sctpTransport); err != nil {
+			pc.sctpTransport.discardFailedDataChannel(dataChannel)
+
 			return nil, err
 		}
 	}
