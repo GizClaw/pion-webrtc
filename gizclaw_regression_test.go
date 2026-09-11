@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,6 +63,18 @@ type gizPairConfig struct {
 	// numStreams is the negotiated SCTP stream count on both sides. A small
 	// value forces DataChannel ID reuse.
 	numStreams uint16
+	// oneWayDelay is added to every packet crossing the virtual router.
+	oneWayDelay time.Duration
+	// loggerFactory, if set, is used for both peers.
+	loggerFactory logging.LoggerFactory
+}
+
+func (cfg gizPairConfig) logger() logging.LoggerFactory {
+	if cfg.loggerFactory != nil {
+		return cfg.loggerFactory
+	}
+
+	return logging.NewDefaultLoggerFactory()
 }
 
 // gizPair is an offerer (client) and answerer (server) connected over vnet.
@@ -87,9 +100,13 @@ func newGizPair(t *testing.T, cfg gizPairConfig) *gizPair {
 	t.Helper()
 
 	pair := &gizPair{t: t}
-	loggerFactory := logging.NewDefaultLoggerFactory()
+	loggerFactory := cfg.logger()
 
-	wan, err := vnet.NewRouter(&vnet.RouterConfig{CIDR: "1.2.3.0/24", LoggerFactory: loggerFactory})
+	wan, err := vnet.NewRouter(&vnet.RouterConfig{
+		CIDR:          "1.2.3.0/24",
+		MinDelay:      cfg.oneWayDelay,
+		LoggerFactory: loggerFactory,
+	})
 	require.NoError(t, err)
 	wan.AddChunkFilter(func(c vnet.Chunk) bool {
 		pct := pair.lossPercent.Load()
@@ -573,6 +590,88 @@ func TestGizclawBurstUnderReceiveWindowPressure(t *testing.T) {
 	stageBurst(p, scaled(t, 256, 128), 16)
 	p.probe("after burst")
 	p.requireBaseline("after burst")
+}
+
+// gizSCTPRecovery counts pion/sctp log lines that mark SCTP loss recovery:
+// T3-rtx timeouts, fast retransmits and RACK loss marking. On a lossless link
+// none of them should ever appear. It also counts the "dropped a new stream"
+// line of pion/sctp versions that discarded DATA for streams beyond a 16-entry
+// accept backlog.
+type gizSCTPRecovery struct {
+	logging.LoggerFactory
+	recoveries atomic.Int64
+	drops      atomic.Int64
+}
+
+func (f *gizSCTPRecovery) NewLogger(scope string) logging.LeveledLogger {
+	return &gizSCTPRecoveryLogger{LeveledLogger: f.LoggerFactory.NewLogger(scope), counts: f}
+}
+
+func (f *gizSCTPRecovery) observe(format string) {
+	if strings.Contains(format, "dropped a new stream") {
+		f.drops.Add(1)
+	}
+	for _, marker := range []string{"T3-rtx timed out", "fast-retransmit:", "RACK: mark lost", "RACK timer: mark lost"} {
+		if strings.Contains(format, marker) {
+			f.recoveries.Add(1)
+		}
+	}
+}
+
+type gizSCTPRecoveryLogger struct {
+	logging.LeveledLogger
+	counts *gizSCTPRecovery
+}
+
+func (l *gizSCTPRecoveryLogger) Debugf(format string, args ...any) {
+	l.counts.observe(format)
+	l.LeveledLogger.Debugf(format, args...)
+}
+
+func (l *gizSCTPRecoveryLogger) Tracef(format string, args ...any) {
+	l.counts.observe(format)
+	l.LeveledLogger.Tracef(format, args...)
+}
+
+// TestGizclawNewChannelBurstLatency opens bursts of request channels at once
+// over a lossless 28 ms RTT link, like the Edge forwarding a burst of HTTP
+// requests. SCTP used to accept at most 16 new streams ahead of the
+// application and discard the DATA of any further ones without a SACK, so
+// those channels only opened after loss recovery (GizClaw measured p99 3-4 s
+// and requests exceeding 5 s). On a lossless link no SCTP loss recovery may
+// happen at all, and every request must finish well within the 1 s initial
+// RTO.
+func TestGizclawNewChannelBurstLatency(t *testing.T) {
+	channels := scaled(t, 330, 64)
+	rounds := scaled(t, 5, 2)
+	logs := &gizSCTPRecovery{LoggerFactory: logging.NewDefaultLoggerFactory()}
+	pair := newGizPair(t, gizPairConfig{oneWayDelay: 14 * time.Millisecond, loggerFactory: logs})
+	require.Zero(t, logs.recoveries.Load(), "SCTP loss recovery during connect on a lossless link")
+
+	for round := range rounds {
+		var slowest atomic.Int64
+		err := runConcurrent(channels, channels, func(i int) error {
+			start := time.Now()
+			err := pair.requestN(fmt.Sprintf("latency-%d-%d", round, i), fmt.Appendf(nil, "req-%d", i), 1, nil)
+			elapsed := int64(time.Since(start))
+			for {
+				prev := slowest.Load()
+				if elapsed <= prev || slowest.CompareAndSwap(prev, elapsed) {
+					break
+				}
+			}
+
+			return err
+		})
+		require.NoError(t, err)
+		require.Zero(t, logs.recoveries.Load(),
+			"round %d: SCTP loss recovery on a lossless link (%d new streams dropped)", round, logs.drops.Load())
+		require.Less(t, time.Duration(slowest.Load()), time.Second,
+			"round %d: slowest of %d concurrent requests", round, channels)
+	}
+
+	pair.probe("after bursts")
+	pair.requireBaseline("after bursts")
 }
 
 func TestGizclawRequestChurnReusesDataChannelIDs(t *testing.T) {
