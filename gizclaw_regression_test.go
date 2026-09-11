@@ -28,10 +28,11 @@ package webrtc
 //     abandoned, and retransmission recovery under packet loss (pion-sctp
 //     "Complete pending stream resets after FORWARD-TSN", "Rearm T3 after RACK
 //     tail loss probe").
-//
-// Known, unfixed issues found by this suite are skipped unless
-// GIZCLAW_KNOWN_ISSUES=1: TestGizclawFragmentedMessagesExceedingReceiveWindow
-// and TestGizclawClosedStreamEchoesUnderLossExceedingWindow.
+//   - Receive-window deadlocks: interleaved fragmented messages that together
+//     exceed the receive buffer (pion-sctp "Keep accepting DATA while no
+//     message is readable"), and unread data of closed channels holding the
+//     window (pion-sctp "Keep PR policy of chunks after peer stream reset",
+//     "Add option to discard inbound data after Close").
 //
 // Run with: go test -race -run 'TestGizclaw|TestSCTPTransportAcceptDataChannels' -v .
 // -short scales the workloads down.
@@ -41,7 +42,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -718,18 +718,16 @@ func TestGizclawLossyPartialReliableClose(t *testing.T) {
 	p.requireBaseline("after loss")
 }
 
-// TestGizclawClosedStreamEchoesUnderLossExceedingWindow is a known, unfixed
-// issue: 8 partially reliable channels each write 200 x 900 B and close
-// without reading while request churn runs under 5% loss. The answerer echoes
-// everything, about 1.44 MB towards the offerer's 1 MiB receive buffer. After
-// the stage the offerer keeps advertising a zero window and drops every new
-// DATA chunk, so a fresh DataChannel's reply never arrives and the
-// association's receive direction is dead. Without loss, or below the window
-// size, the same traffic recovers. Set GIZCLAW_KNOWN_ISSUES=1 to run it.
+// TestGizclawClosedStreamEchoesUnderLossExceedingWindow: 8 partially
+// reliable channels each write 200 x 900 B and close without reading while
+// request churn runs under 5% loss. The answerer echoes everything, about
+// 1.44 MB towards the offerer's 1 MiB receive buffer. The unread echoes of the
+// closed channels used to fill the offerer's window, while the answerer's
+// stream resets that would free it waited behind more echo data, so the
+// association's receive direction died. SCTP now discards inbound data of
+// closed channels, and abandons lost partially reliable chunks even after the
+// peer reset the stream.
 func TestGizclawClosedStreamEchoesUnderLossExceedingWindow(t *testing.T) {
-	if os.Getenv("GIZCLAW_KNOWN_ISSUES") == "" {
-		t.Skip("known receive-window wedge after closed-stream echoes under loss; set GIZCLAW_KNOWN_ISSUES=1")
-	}
 	p := newGizPair(t, gizPairConfig{})
 	stageLossy(p, 5, 100, 8, 200)
 	p.probe("after loss")
@@ -764,19 +762,13 @@ func TestGizclawChainedLifecycle(t *testing.T) {
 	p.requireBaseline("end of lifecycle")
 }
 
-// TestGizclawFragmentedMessagesExceedingReceiveWindow is a known, unfixed
-// pion/sctp deadlock (also present in upstream v1.11.1): when concurrent
+// TestGizclawFragmentedMessagesExceedingReceiveWindow: concurrent
 // multi-fragment messages from several streams together exceed the receive
-// window, the window fills with partial messages that the application cannot
-// read, the fragments that would complete them are dropped for lack of window,
-// and the association stops making progress on those streams permanently.
-// GizClaw currently avoids it by sizing the receive buffer for its bounded
-// stream count (gizwebrtc.GatewaySCTPReceiveBufferSize). Set
-// GIZCLAW_KNOWN_ISSUES=1 to run it.
+// window. With I-DATA their fragments interleave, so the window used to fill
+// with partial messages that the application could not read while the
+// fragments that would complete them were dropped for lack of window, a
+// permanent deadlock also present in upstream pion/sctp v1.11.1.
 func TestGizclawFragmentedMessagesExceedingReceiveWindow(t *testing.T) {
-	if os.Getenv("GIZCLAW_KNOWN_ISSUES") == "" {
-		t.Skip("known pion/sctp receive-window deadlock with fragmented messages; set GIZCLAW_KNOWN_ISSUES=1")
-	}
 	p := newGizPair(t, gizPairConfig{answerReceiveBuffer: 64 * 1024})
 	// 5 x 16 KiB = 80 KiB of concurrent fragmented messages into a 64 KiB window.
 	payload := bytes.Repeat([]byte{'f'}, 16*1024)
