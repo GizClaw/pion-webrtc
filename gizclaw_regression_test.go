@@ -20,7 +20,8 @@ package webrtc
 //     pion/webrtc#3535; the lost-OPEN wedge itself is reproduced at wire level
 //     in sctptransport_accept_test.go).
 //   - DataChannel ID exhaustion on long-lived associations and ID reuse after
-//     stream reset (GizClaw/gizclaw#776, pion/webrtc#3534, pion/sctp#494).
+//     stream reset (GizClaw/gizclaw#776, pion/webrtc#3534, pion/sctp#494),
+//     including immediate reuse racing a late stream reset response.
 //   - Concurrent closes leaving remote streams open because stream resets were
 //     not serialized (GizClaw/gizclaw#1143).
 //   - Stream resets never completing after partially reliable data is
@@ -29,9 +30,8 @@ package webrtc
 //     tail loss probe").
 //
 // Known, unfixed issues found by this suite are skipped unless
-// GIZCLAW_KNOWN_ISSUES=1: TestGizclawFragmentedMessagesExceedingReceiveWindow,
-// TestGizclawImmediateDataChannelIDReuse and
-// TestGizclawClosedStreamEchoesUnderLossExceedingWindow.
+// GIZCLAW_KNOWN_ISSUES=1: TestGizclawFragmentedMessagesExceedingReceiveWindow
+// and TestGizclawClosedStreamEchoesUnderLossExceedingWindow.
 //
 // Run with: go test -race -run 'TestGizclaw|TestSCTPTransportAcceptDataChannels' -v .
 // -short scales the workloads down.
@@ -684,19 +684,16 @@ func TestGizclawRequestChurnReusesDataChannelIDs(t *testing.T) {
 	p.requireBaseline("after churn")
 }
 
-// TestGizclawImmediateDataChannelIDReuse is a known, unfixed issue: when the
-// ID space is nearly exhausted, an ID released by a completed reset is reused
-// at once, and occasionally the answerer's reply on the new channel never
-// reaches the offerer even though the answerer read the request and wrote the
-// reply. The suspected cause is a race between the offerer releasing the ID
-// and the answerer resetting its outgoing stream sequence (MID) for that
-// stream. With GizClaw's default 65535 streams, IDs rotate through the whole
-// space before reuse, which makes this rare. Set GIZCLAW_KNOWN_ISSUES=1 to run
-// it.
+// TestGizclawImmediateDataChannelIDReuse nearly exhausts the ID space so an ID
+// released by a completed reset is reused at once. The offerer sees the reset
+// complete as soon as it answers the answerer's outgoing reset and may send
+// the new channel's DCEP OPEN before the answerer receives that answer. The
+// late answer used to reset the outgoing MID of the answerer's new stream
+// after its DCEP ACK, so the reply repeated MID 0 and the offerer never
+// delivered it (pion-sctp "Keep reused stream counters on late reset
+// response"). With GizClaw's default 65535 streams, IDs rotate through the
+// whole space before reuse, which made this rare.
 func TestGizclawImmediateDataChannelIDReuse(t *testing.T) {
-	if os.Getenv("GIZCLAW_KNOWN_ISSUES") == "" {
-		t.Skip("known lost reply on immediately reused DataChannel IDs; set GIZCLAW_KNOWN_ISSUES=1")
-	}
 	// 16 IDs per side with 8 requests in flight forces immediate reuse.
 	p := newGizPair(t, gizPairConfig{numStreams: 32})
 	stageChurn(p, 300, 8)
