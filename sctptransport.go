@@ -206,6 +206,9 @@ func (r *SCTPTransport) sctpClientOptions(netConn net.Conn, maxMessageSize uint3
 		sctp.WithLoggerFactory(r.api.settingEngine.LoggerFactory),
 		sctp.WithMTU(sctpOutboundMTU),
 		sctp.WithMaxMessageSize(maxMessageSize),
+		// A closed DataChannel discards the messages it receives, so they
+		// must not hold the association's receive window either.
+		sctp.WithDiscardInboundAfterClose(true),
 	}
 
 	return append(opts, r.optionalSCTPClientOptions()...)
