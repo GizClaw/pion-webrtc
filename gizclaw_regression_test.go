@@ -50,7 +50,7 @@ import (
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"
-	"github.com/pion/transport/v4/vnet"
+	"github.com/pion/transport/v5/vnet"
 	"github.com/stretchr/testify/require"
 )
 
