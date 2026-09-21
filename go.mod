@@ -34,4 +34,4 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-replace github.com/pion/sctp => github.com/GizClaw/pion-sctp v0.0.0-20260920142309-3a498c96e0c0
+replace github.com/pion/sctp => github.com/GizClaw/pion-sctp v0.0.0-20260921183244-b7bf60b47a19
