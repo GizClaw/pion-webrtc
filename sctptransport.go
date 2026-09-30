@@ -30,8 +30,8 @@ type dataChannelReservation struct {
 	resetReservation *dataChannelResetReservation
 }
 
-// The FIFO remains after a failed open releases its ID, so a delayed reset
-// notification consumes that old stream's token rather than a newer owner.
+// Pending-reset tokens remain after a failed open releases its ID, so a
+// delayed notification consumes that stream's token rather than a newer owner.
 type dataChannelResetReservation struct {
 	owner       weak.Pointer[DataChannel]
 	association weak.Pointer[sctp.Association]
@@ -956,6 +956,11 @@ func (r *SCTPTransport) releaseDataChannelReservation(channel weak.Pointer[DataC
 	}
 	delete(r.dataChannelReservations, channel)
 	if reservation.resetReservation != nil {
+		// A failed binding on an open stream has not started a reset of its own.
+		// Keep Closing/Closed tombstones to absorb their delayed SID notification.
+		if stream := reservation.stream.Value(); stream != nil && stream.State() == sctp.StreamStateOpen {
+			r.discardDataChannelResetReservationLocked(reservation.id, reservation.resetReservation)
+		}
 		r.discardLocalDataChannelGenerationLocked(reservation.id, reservation.resetReservation)
 	}
 	r.releaseDataChannelIDCount(reservation.id, 1)
@@ -1023,6 +1028,27 @@ func (r *SCTPTransport) bindDataChannelLocked(channel *DataChannel, association 
 	return nil
 }
 
+// The caller must hold r.lock. Remove only this owner's token: other owners
+// of the same SID may still have real reset notifications pending.
+func (r *SCTPTransport) discardDataChannelResetReservationLocked(id uint16, target *dataChannelResetReservation) {
+	queue := r.dataChannelResetReservations[id]
+	for i, token := range queue {
+		if token != target {
+			continue
+		}
+		copy(queue[i:], queue[i+1:])
+		queue[len(queue)-1] = nil
+		queue = queue[:len(queue)-1]
+		if len(queue) == 0 {
+			delete(r.dataChannelResetReservations, id)
+		} else {
+			r.dataChannelResetReservations[id] = queue
+		}
+
+		return
+	}
+}
+
 // The caller must hold r.lock. Drop precisely the old discarded generations,
 // including detached channels and failed-open tokens with no reservation left.
 func (r *SCTPTransport) reconcileDataChannelResetReservations(association *sctp.Association, event sctp.AssociationRestartEvent, retained map[*sctp.Stream]struct{}) {
@@ -1072,4 +1098,12 @@ func (r *SCTPTransport) validateDataChannelID(channel *DataChannel, association 
 	r.releaseDataChannelReservation(weak.Make(channel))
 
 	return &rtcerr.OperationError{Err: ErrMaxDataChannelID}
+}
+
+// releaseFailedDataChannelBinding releases only the owner whose open failed.
+// Constructor and PeerConnection failure cleanup may safely run afterwards.
+func (r *SCTPTransport) releaseFailedDataChannelBinding(channel *DataChannel) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.releaseDataChannelReservation(weak.Make(channel))
 }

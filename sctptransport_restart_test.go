@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -644,4 +645,35 @@ func TestSCTPTransportPeerRestartRejectsNewOutOfRangeBindings(t *testing.T) {
 	assert.Equal(t, "retained above reduced limit", string(buffer[:n]))
 	runtime.KeepAlive(pending)
 	runtime.KeepAlive(retained)
+}
+
+func TestSCTPTransportFailedOpenReleasesReservation(t *testing.T) {
+	for _, existingOwner := range []bool{false, true} {
+		name := "unreserved ID"
+		if existingOwner {
+			name = "overlapping existing owner"
+		}
+		t.Run(name, func(t *testing.T) {
+			pair := newRestartTestPair(t)
+			transport := pair.transport
+			id := uint16(0)
+			var retained *DataChannel
+			if existingOwner {
+				retained, _ = pair.openLocal(t, id)
+			}
+			baseline := restartIDCount(transport, id)
+			_, err := transport.api.NewDataChannel(transport, &DataChannelParameters{
+				ID: &id, Ordered: true, Protocol: strings.Repeat("x", 1<<16),
+			})
+			require.ErrorIs(t, err, datachannel.ErrTooLongProtocol)
+			assert.Equal(t, baseline, restartIDCount(transport, id), "failed DCEP marshal must release only its newly bound owner")
+			transport.lock.RLock()
+			assert.Len(t, transport.dataChannelReservations, int(baseline))
+			transport.lock.RUnlock()
+			if retained != nil {
+				assert.Equal(t, sctp.StreamStateOpen, restartReservation(t, transport, retained).stream.Value().State())
+			}
+			runtime.KeepAlive(retained)
+		})
+	}
 }

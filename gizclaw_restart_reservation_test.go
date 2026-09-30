@@ -9,6 +9,8 @@ import (
 	"context"
 	"io"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"weak"
@@ -179,4 +181,56 @@ func TestGizclawRestartDiscardsDetachedLocalClassifier(t *testing.T) {
 	runtime.KeepAlive(old)
 	runtime.KeepAlive(retained)
 	runtime.KeepAlive(fresh)
+}
+
+func TestGizclawRestartFailedOpenReusesOpenStream(t *testing.T) {
+	for _, existingOwner := range []bool{false, true} {
+		name := "reuse after failure"
+		if existingOwner {
+			name = "failure alongside existing owner"
+		}
+		t.Run(name, func(t *testing.T) {
+			pair := newRestartTestPair(t)
+			transport := pair.transport
+			id := uint16(0)
+			var fresh *DataChannel
+			var peerChannel *datachannel.DataChannel
+			if existingOwner {
+				fresh, peerChannel = pair.openLocal(t, id)
+			}
+			baseline := restartIDCount(transport, id)
+			_, err := transport.api.NewDataChannel(transport, &DataChannelParameters{
+				ID: &id, Ordered: true, Protocol: strings.Repeat("x", 1<<16),
+			})
+			require.ErrorIs(t, err, datachannel.ErrTooLongProtocol)
+			stream, err := pair.association.OpenStream(id, sctp.PayloadTypeWebRTCBinary)
+			require.NoError(t, err)
+			require.Equal(t, sctp.StreamStateOpen, stream.State(), "abandoning a failed open has not requested a reset")
+			require.Equal(t, baseline, restartIDCount(transport, id))
+
+			// A successful DCEP channel uses this exact still-open SCTP Stream. Only
+			// its eventual close will produce a real reset notification.
+			if !existingOwner {
+				fresh, peerChannel = pair.openLocal(t, id)
+			}
+			require.Same(t, stream, restartReservation(t, transport, fresh).stream.Value())
+			var resets atomic.Uint32
+			pair.association.OnStreamResetComplete(func(streamID uint16) {
+				transport.onStreamResetComplete(pair.association, streamID)
+				resets.Add(1)
+			})
+			require.NoError(t, fresh.Close())
+			require.NoError(t, peerChannel.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err = peerChannel.ReadDataChannel(make([]byte, 64))
+			require.ErrorIs(t, err, io.EOF)
+			require.Eventually(t, func() bool { return resets.Load() == 1 }, 5*time.Second, time.Millisecond)
+			assert.Equal(t, uint32(0), restartIDCount(transport, id), "the single reset must release the successful owner's ID")
+			transport.lock.RLock()
+			assert.Empty(t, transport.dataChannelReservations)
+			assert.Empty(t, transport.dataChannelResetReservations)
+			assert.Empty(t, transport.localDataChannelGenerations)
+			transport.lock.RUnlock()
+			runtime.KeepAlive(fresh)
+		})
+	}
 }

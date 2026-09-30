@@ -194,6 +194,12 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 
 		return err
 	}
+	opened := false
+	defer func() {
+		if !opened {
+			sctpTransport.releaseFailedDataChannelBinding(d)
+		}
+	}()
 	dc, err := datachannel.Client(stream, cfg)
 	if err != nil {
 		d.sctpTransport.unregisterLocalDataChannelGeneration(*d.id, generation)
@@ -212,6 +218,7 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 	}
 	d.onDial()
 	d.handleOpen(dc, false, d.negotiated)
+	opened = true
 
 	return nil
 }
