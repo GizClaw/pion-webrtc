@@ -12,6 +12,7 @@ import (
 	"net"
 	"sync"
 	"time"
+	"weak"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"
@@ -20,6 +21,23 @@ import (
 )
 
 const sctpMaxChannels = uint16(65535)
+
+type dataChannelReservation struct {
+	id               uint16
+	association      weak.Pointer[sctp.Association]
+	stream           weak.Pointer[sctp.Stream]
+	generation       uint64
+	resetReservation *dataChannelResetReservation
+}
+
+// The FIFO remains after a failed open releases its ID, so a delayed reset
+// notification consumes that old stream's token rather than a newer owner.
+type dataChannelResetReservation struct {
+	owner       weak.Pointer[DataChannel]
+	association weak.Pointer[sctp.Association]
+	stream      weak.Pointer[sctp.Stream]
+	generation  uint64
+}
 
 // defaultSCTPDataChannelOpenTimeout bounds how long an accepted SCTP stream may
 // wait for its DCEP DATA_CHANNEL_OPEN before the stream is closed.
@@ -76,7 +94,10 @@ type SCTPTransport struct {
 	dataChannels []*DataChannel
 	// Count reservations because a reused stream can arrive before the old
 	// generation's reset-complete callback runs on this association.
-	dataChannelIDsUsed map[uint16]uint32
+	dataChannelIDsUsed           map[uint16]uint32
+	dataChannelReservations      map[weak.Pointer[DataChannel]]dataChannelReservation
+	dataChannelResetReservations map[uint16][]*dataChannelResetReservation
+	associationGeneration        uint64
 	// Advance allocations within the negotiated DTLS-role parity instead of
 	// immediately selecting the lowest released ID again. Reset completion is
 	// still the reuse boundary, while spreading successive short-lived channels
@@ -104,12 +125,14 @@ type SCTPTransport struct {
 // meant to be used together with the basic WebRTC API.
 func (api *API) NewSCTPTransport(dtls *DTLSTransport) *SCTPTransport {
 	res := &SCTPTransport{
-		dtlsTransport:               dtls,
-		state:                       SCTPTransportStateConnecting,
-		api:                         api,
-		log:                         api.settingEngine.LoggerFactory.NewLogger("ortc"),
-		dataChannelIDsUsed:          make(map[uint16]uint32),
-		localDataChannelGenerations: make(map[uint16][]*localDataChannelGeneration),
+		dtlsTransport:                dtls,
+		state:                        SCTPTransportStateConnecting,
+		api:                          api,
+		log:                          api.settingEngine.LoggerFactory.NewLogger("ortc"),
+		dataChannelIDsUsed:           make(map[uint16]uint32),
+		dataChannelReservations:      make(map[weak.Pointer[DataChannel]]dataChannelReservation),
+		dataChannelResetReservations: make(map[uint16][]*dataChannelResetReservation),
+		localDataChannelGenerations:  make(map[uint16][]*localDataChannelGeneration),
 	}
 
 	res.updateMaxChannels()
@@ -187,14 +210,10 @@ func (r *SCTPTransport) StartContext(ctx context.Context, capabilities SCTPCapab
 
 		return err
 	}
-	sctpAssociation.OnStreamResetComplete(r.releaseDataChannelID)
-
-	r.lock.Lock()
-	r.sctpAssociation = sctpAssociation
-	r.state = SCTPTransportStateConnected
-	r.maxChannels = maxChannelsForAssociation(sctpAssociation)
+	r.setAssociation(sctpAssociation)
+	r.lock.RLock()
 	dataChannels := append([]*DataChannel{}, r.dataChannels...)
-	r.lock.Unlock()
+	r.lock.RUnlock()
 
 	var openedDCCount uint32
 	for _, d := range dataChannels {
@@ -300,6 +319,7 @@ func (r *SCTPTransport) Stop() error {
 	r.lock.Unlock()
 
 	association.OnStreamResetComplete(nil)
+	association.OnAssociationRestart(nil)
 	association.Abort("")
 
 	return nil
@@ -348,19 +368,56 @@ func (r *SCTPTransport) acceptDataChannels(
 }
 
 type localDataChannelGeneration struct {
-	accepted bool
+	accepted         bool
+	resetReservation *dataChannelResetReservation
 }
 
-func (r *SCTPTransport) registerLocalDataChannelGeneration(streamID uint16) *localDataChannelGeneration {
+func (r *SCTPTransport) registerLocalDataChannelGeneration(streamID uint16, reservation *dataChannelResetReservation) *localDataChannelGeneration {
 	r.lock.Lock()
 	defer r.lock.Unlock()
+
+	return r.registerLocalDataChannelGenerationLocked(streamID, reservation)
+}
+
+// The caller must hold r.lock.
+func (r *SCTPTransport) registerLocalDataChannelGenerationLocked(streamID uint16, reservation *dataChannelResetReservation) *localDataChannelGeneration {
 	if r.localDataChannelGenerations == nil {
 		r.localDataChannelGenerations = make(map[uint16][]*localDataChannelGeneration)
 	}
-	generation := &localDataChannelGeneration{}
+	generation := &localDataChannelGeneration{resetReservation: reservation}
 	r.localDataChannelGenerations[streamID] = append(r.localDataChannelGenerations[streamID], generation)
-
 	return generation
+}
+
+func (r *SCTPTransport) bindLocalDataChannel(channel *DataChannel, association *sctp.Association, stream *sctp.Stream) (*localDataChannelGeneration, error) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if err := r.bindDataChannelLocked(channel, association, stream); err != nil {
+		return nil, err
+	}
+	reservation := r.dataChannelReservations[weak.Make(channel)]
+
+	return r.registerLocalDataChannelGenerationLocked(reservation.id, reservation.resetReservation), nil
+}
+
+// The caller must hold r.lock. Match the generation token, not just the SID.
+func (r *SCTPTransport) discardLocalDataChannelGenerationLocked(streamID uint16, reservation *dataChannelResetReservation) {
+	generations := r.localDataChannelGenerations[streamID]
+	for i := 0; i < len(generations); {
+		if generations[i].resetReservation != reservation {
+			i++
+
+			continue
+		}
+		copy(generations[i:], generations[i+1:])
+		generations[len(generations)-1] = nil
+		generations = generations[:len(generations)-1]
+	}
+	if len(generations) == 0 {
+		delete(r.localDataChannelGenerations, streamID)
+	} else {
+		r.localDataChannelGenerations[streamID] = generations
+	}
 }
 
 func (r *SCTPTransport) acceptLocalDataChannelGeneration(streamID uint16) bool {
@@ -490,7 +547,16 @@ func (r *SCTPTransport) openAcceptedDataChannel(assoc *sctp.Association, stream 
 		return
 	}
 
-	<-r.onDataChannel(rtcDC)
+	accepted, err := r.onDataChannel(rtcDC, assoc, stream)
+	if err != nil {
+		_ = dc.Close()
+
+		return
+	}
+	<-accepted
+	if !r.isDataChannelBound(rtcDC, assoc, stream) {
+		return
+	}
 	rtcDC.handleOpen(dc, true, dc.Config.Negotiated)
 
 	r.lock.Lock()
@@ -560,17 +626,15 @@ func (r *SCTPTransport) OnDataChannelOpened(f func(*DataChannel)) {
 	r.onDataChannelOpenedHandler = f
 }
 
-func (r *SCTPTransport) onDataChannel(dc *DataChannel) (done chan struct{}) {
+func (r *SCTPTransport) onDataChannel(dc *DataChannel, association *sctp.Association, stream *sctp.Stream) (done chan struct{}, err error) {
 	r.lock.Lock()
+	if err = r.bindDataChannelLocked(dc, association, stream); err != nil {
+		r.lock.Unlock()
+
+		return nil, err
+	}
 	r.dataChannels = append(r.dataChannels, dc)
 	r.dataChannelsAccepted++
-	if dc.ID() != nil {
-		r.dataChannelIDsUsed[*dc.ID()]++
-	} else {
-		// This cannot happen, the constructor for this datachannel in the caller
-		// takes a pointer to the id.
-		r.log.Errorf("accepted data channel with no ID")
-	}
 	handler := r.onDataChannelHandler
 	r.lock.Unlock()
 
@@ -611,17 +675,50 @@ func maxChannelsForAssociation(association *sctp.Association) *uint16 {
 
 func (r *SCTPTransport) releaseDataChannelID(streamID uint16) {
 	r.lock.Lock()
-	if generations := r.localDataChannelGenerations[streamID]; len(generations) <= 1 {
-		delete(r.localDataChannelGenerations, streamID)
-	} else {
-		r.localDataChannelGenerations[streamID] = generations[1:]
+	defer r.lock.Unlock()
+	r.releaseDataChannelIDLocked(streamID)
+}
+
+func (r *SCTPTransport) onStreamResetComplete(association *sctp.Association, streamID uint16) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if r.sctpAssociation == association && r.state == SCTPTransportStateConnected {
+		r.releaseDataChannelIDLocked(streamID)
 	}
-	r.releaseDataChannelReservationLocked(streamID)
-	r.lock.Unlock()
+}
+
+// The caller must hold r.lock. Reset callbacks carry only SID, so consume the
+// oldest bound stream's token, including an already released failed open.
+func (r *SCTPTransport) releaseDataChannelIDLocked(streamID uint16) {
+	queue := r.dataChannelResetReservations[streamID]
+	if len(queue) == 0 {
+		// Legacy callers/tests can reserve an ID without binding a stream.
+		if len(r.dataChannelReservations) == 0 {
+			if generations := r.localDataChannelGenerations[streamID]; len(generations) <= 1 {
+				delete(r.localDataChannelGenerations, streamID)
+			} else {
+				r.localDataChannelGenerations[streamID] = generations[1:]
+			}
+			r.releaseDataChannelIDCount(streamID, 1)
+		}
+
+		return
+	}
+	oldest := queue[0]
+	queue[0] = nil
+	if len(queue) == 1 {
+		delete(r.dataChannelResetReservations, streamID)
+	} else {
+		r.dataChannelResetReservations[streamID] = queue[1:]
+	}
+	reservation, ok := r.dataChannelReservations[oldest.owner]
+	if ok && reservation.resetReservation == oldest {
+		r.releaseDataChannelReservation(oldest.owner)
+	}
+	r.discardLocalDataChannelGenerationLocked(streamID, oldest)
 }
 
 func (r *SCTPTransport) discardFailedDataChannel(dataChannel *DataChannel) {
-	streamID := dataChannel.ID()
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -635,18 +732,7 @@ func (r *SCTPTransport) discardFailedDataChannel(dataChannel *DataChannel) {
 
 		break
 	}
-	if streamID != nil {
-		r.releaseDataChannelReservationLocked(*streamID)
-	}
-}
-
-// The caller should hold the SCTPTransport lock.
-func (r *SCTPTransport) releaseDataChannelReservationLocked(streamID uint16) {
-	if r.dataChannelIDsUsed[streamID] > 1 {
-		r.dataChannelIDsUsed[streamID]--
-	} else {
-		delete(r.dataChannelIDsUsed, streamID)
-	}
+	r.releaseDataChannelReservation(weak.Make(dataChannel))
 }
 
 // MaxChannels is the maximum number of RTCDataChannels that can be open simultaneously.
@@ -716,16 +802,18 @@ func (r *SCTPTransport) collectStats(collector *statsReportCollector) {
 	collector.Collect(stats.ID, stats)
 }
 
-func (r *SCTPTransport) generateAndSetDataChannelID(dtlsRole DTLSRole, idOut **uint16) error {
+func (r *SCTPTransport) generateAndSetDataChannelID(dtlsRole DTLSRole, idOut **uint16, channel *DataChannel) error {
 	var firstID uint32
 	if dtlsRole != DTLSRoleClient {
 		firstID++
 	}
 
-	maxVal := uint32(r.MaxChannels())
-
 	r.lock.Lock()
 	defer r.lock.Unlock()
+	maxVal := uint32(sctpMaxChannels)
+	if r.maxChannels != nil {
+		maxVal = uint32(*r.maxChannels)
+	}
 
 	if maxVal <= firstID {
 		return &rtcerr.OperationError{Err: ErrMaxDataChannelID}
@@ -746,7 +834,7 @@ func (r *SCTPTransport) generateAndSetDataChannelID(dtlsRole DTLSRole, idOut **u
 			continue
 		}
 		*idOut = &id
-		r.dataChannelIDsUsed[id] = 1
+		r.reserveDataChannelID(channel, id)
 		r.nextDataChannelID = uint16(start)
 
 		return nil
@@ -794,4 +882,194 @@ func (r *SCTPTransport) GetSctpInit() []byte {
 	}
 
 	return r.localSctpInit
+}
+
+func (r *SCTPTransport) setAssociation(association *sctp.Association) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.sctpAssociation = association
+	r.state = SCTPTransportStateConnected
+	r.associationGeneration = 0
+	r.maxChannels = maxChannelsForAssociation(association)
+	association.OnStreamResetComplete(func(streamID uint16) {
+		r.onStreamResetComplete(association, streamID)
+	})
+	association.OnAssociationRestart(func(event sctp.AssociationRestartEvent) {
+		r.onAssociationRestart(association, event)
+	})
+}
+
+func (r *SCTPTransport) setMaxChannels(inbound, outbound uint16) {
+	value := min(inbound, outbound)
+	r.maxChannels = &value
+}
+
+func (r *SCTPTransport) onAssociationRestart(association *sctp.Association, event sctp.AssociationRestartEvent) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if r.sctpAssociation != association || r.state != SCTPTransportStateConnected ||
+		event.Generation <= r.associationGeneration {
+		return
+	}
+	r.associationGeneration = event.Generation
+	r.setMaxChannels(event.NumInboundStreams, event.NumOutboundStreams)
+	retained := make(map[*sctp.Stream]struct{}, len(event.RetainedStreams))
+	for _, stream := range event.RetainedStreams {
+		retained[stream] = struct{}{}
+	}
+	for channel, reservation := range r.dataChannelReservations {
+		if reservation.association.Value() != association || reservation.generation >= event.Generation {
+			continue
+		}
+		if _, ok := retained[reservation.stream.Value()]; ok {
+			reservation.generation = event.Generation
+			r.dataChannelReservations[channel] = reservation
+
+			continue
+		}
+		r.releaseDataChannelReservation(channel)
+	}
+	r.reconcileDataChannelResetReservations(association, event, retained)
+}
+
+func (r *SCTPTransport) reserveDataChannelID(channel *DataChannel, id uint16) {
+	if channel == nil {
+		r.dataChannelIDsUsed[id]++
+
+		return
+	}
+	if r.dataChannelReservations == nil {
+		r.dataChannelReservations = make(map[weak.Pointer[DataChannel]]dataChannelReservation)
+	}
+	key := weak.Make(channel)
+	if _, ok := r.dataChannelReservations[key]; ok {
+		return
+	}
+	r.dataChannelReservations[key] = dataChannelReservation{id: id}
+	r.dataChannelIDsUsed[id]++
+}
+
+func (r *SCTPTransport) releaseDataChannelReservation(channel weak.Pointer[DataChannel]) {
+	reservation, ok := r.dataChannelReservations[channel]
+	if !ok {
+		return
+	}
+	delete(r.dataChannelReservations, channel)
+	if reservation.resetReservation != nil {
+		r.discardLocalDataChannelGenerationLocked(reservation.id, reservation.resetReservation)
+	}
+	r.releaseDataChannelIDCount(reservation.id, 1)
+}
+
+func (r *SCTPTransport) releaseDataChannelIDCount(id uint16, count uint32) {
+	if r.dataChannelIDsUsed[id] <= count {
+		delete(r.dataChannelIDsUsed, id)
+	} else {
+		r.dataChannelIDsUsed[id] -= count
+	}
+}
+
+func (r *SCTPTransport) bindDataChannel(channel *DataChannel, association *sctp.Association, stream *sctp.Stream) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	return r.bindDataChannelLocked(channel, association, stream)
+}
+
+func (r *SCTPTransport) isDataChannelBound(channel *DataChannel, association *sctp.Association, stream *sctp.Stream) bool {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+	reservation, ok := r.dataChannelReservations[weak.Make(channel)]
+
+	return ok && r.sctpAssociation == association && r.state == SCTPTransportStateConnected &&
+		reservation.association.Value() == association && reservation.stream.Value() == stream && stream.State() == sctp.StreamStateOpen
+}
+
+func (r *SCTPTransport) bindDataChannelLocked(channel *DataChannel, association *sctp.Association, stream *sctp.Stream) error {
+	if stream == nil {
+		r.releaseDataChannelReservation(weak.Make(channel))
+
+		return io.ErrClosedPipe
+	}
+	// Capture the generation before checking state. A discarded stream also
+	// advances its generation during restart, but is no longer open.
+	generation := stream.AssociationGeneration()
+	if r.sctpAssociation != association || r.state != SCTPTransportStateConnected || stream.State() != sctp.StreamStateOpen {
+		r.releaseDataChannelReservation(weak.Make(channel))
+
+		return io.ErrClosedPipe
+	}
+	if !r.isDataChannelBindingWithinLimit(channel, association, stream.StreamIdentifier(), stream) {
+		r.releaseDataChannelReservation(weak.Make(channel))
+
+		return &rtcerr.OperationError{Err: ErrMaxDataChannelID}
+	}
+	r.reserveDataChannelID(channel, stream.StreamIdentifier())
+	key := weak.Make(channel)
+	reservation := r.dataChannelReservations[key]
+	reservation.association = weak.Make(association)
+	reservation.stream = weak.Make(stream)
+	reservation.generation = generation
+	if reservation.resetReservation == nil || reservation.resetReservation.stream.Value() != stream {
+		token := &dataChannelResetReservation{owner: key, association: weak.Make(association), stream: weak.Make(stream), generation: generation}
+		reservation.resetReservation = token
+		if r.dataChannelResetReservations == nil {
+			r.dataChannelResetReservations = make(map[uint16][]*dataChannelResetReservation)
+		}
+		r.dataChannelResetReservations[reservation.id] = append(r.dataChannelResetReservations[reservation.id], token)
+	}
+	r.dataChannelReservations[key] = reservation
+
+	return nil
+}
+
+// The caller must hold r.lock. Drop precisely the old discarded generations,
+// including detached channels and failed-open tokens with no reservation left.
+func (r *SCTPTransport) reconcileDataChannelResetReservations(association *sctp.Association, event sctp.AssociationRestartEvent, retained map[*sctp.Stream]struct{}) {
+	for id, queue := range r.dataChannelResetReservations {
+		kept := queue[:0]
+		for _, token := range queue {
+			if token.association.Value() == association && token.generation < event.Generation {
+				if _, ok := retained[token.stream.Value()]; !ok {
+					r.discardLocalDataChannelGenerationLocked(id, token)
+
+					continue
+				}
+				token.generation = event.Generation
+			}
+			kept = append(kept, token)
+		}
+		clear(queue[len(kept):])
+		if len(kept) == 0 {
+			delete(r.dataChannelResetReservations, id)
+		} else {
+			r.dataChannelResetReservations[id] = kept
+		}
+	}
+}
+
+func (r *SCTPTransport) isDataChannelBindingWithinLimit(channel *DataChannel, association *sctp.Association, id uint16, stream *sctp.Stream) bool {
+	limit := sctpMaxChannels
+	if r.maxChannels != nil {
+		limit = *r.maxChannels
+	}
+	if id < limit {
+		return true
+	}
+	reservation, ok := r.dataChannelReservations[weak.Make(channel)]
+	boundStream := reservation.stream.Value()
+
+	return ok && reservation.id == id && reservation.association.Value() == association && boundStream != nil &&
+		(stream == nil || boundStream == stream)
+}
+
+func (r *SCTPTransport) validateDataChannelID(channel *DataChannel, association *sctp.Association, id uint16) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if r.isDataChannelBindingWithinLimit(channel, association, id, nil) {
+		return nil
+	}
+	r.releaseDataChannelReservation(weak.Make(channel))
+
+	return &rtcerr.OperationError{Err: ErrMaxDataChannelID}
 }

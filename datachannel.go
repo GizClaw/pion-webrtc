@@ -77,6 +77,7 @@ func (api *API) NewDataChannel(transport *SCTPTransport, params *DataChannelPara
 
 	err = d.open(transport)
 	if err != nil {
+		transport.discardFailedDataChannel(d)
 		return nil, err
 	}
 
@@ -169,17 +170,17 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 		// avoid holding lock when generating ID, since id generation locks
 		d.mu.Unlock()
 		var dcID *uint16
-		err := d.sctpTransport.generateAndSetDataChannelID(d.sctpTransport.dtlsTransport.role(), &dcID)
+		err := d.sctpTransport.generateAndSetDataChannelID(d.sctpTransport.dtlsTransport.role(), &dcID, d)
 		if err != nil {
 			return err
 		}
 		d.mu.Lock()
 		d.id = dcID
 	}
-	if *d.id >= sctpTransport.MaxChannels() {
+	if err := sctpTransport.validateDataChannelID(d, association, *d.id); err != nil {
 		d.mu.Unlock()
 
-		return &rtcerr.OperationError{Err: ErrMaxDataChannelID}
+		return err
 	}
 	stream, err := association.OpenStream(*d.id, sctp.PayloadTypeWebRTCBinary)
 	if err != nil {
@@ -187,7 +188,12 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 
 		return err
 	}
-	generation := d.sctpTransport.registerLocalDataChannelGeneration(*d.id)
+	generation, err := d.sctpTransport.bindLocalDataChannel(d, association, stream)
+	if err != nil {
+		d.mu.Unlock()
+
+		return err
+	}
 	dc, err := datachannel.Client(stream, cfg)
 	if err != nil {
 		d.sctpTransport.unregisterLocalDataChannelGeneration(*d.id, generation)
@@ -201,6 +207,9 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 	dc.OnBufferedAmountLow(d.onBufferedAmountLow)
 	d.mu.Unlock()
 
+	if !sctpTransport.isDataChannelBound(d, association, stream) {
+		return io.ErrClosedPipe
+	}
 	d.onDial()
 	d.handleOpen(dc, false, d.negotiated)
 

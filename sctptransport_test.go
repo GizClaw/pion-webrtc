@@ -55,7 +55,7 @@ func TestGenerateDataChannelID(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		idPtr := new(uint16)
-		err := testCase.s.generateAndSetDataChannelID(testCase.role, &idPtr)
+		err := testCase.s.generateAndSetDataChannelID(testCase.role, &idPtr, nil)
 		assert.NoError(t, err, "failed to generate data channel id")
 		assert.Equal(t, testCase.result, *idPtr)
 		assert.Contains(
@@ -83,12 +83,12 @@ func TestGenerateDataChannelIDRespectsNegotiatedLimitAndParity(t *testing.T) {
 
 			for _, expected := range testCase.expected {
 				id := new(uint16)
-				require.NoError(t, transport.generateAndSetDataChannelID(testCase.role, &id))
+				require.NoError(t, transport.generateAndSetDataChannelID(testCase.role, &id, nil))
 				require.Equal(t, expected, *id)
 			}
 
 			id := new(uint16)
-			err := transport.generateAndSetDataChannelID(testCase.role, &id)
+			err := transport.generateAndSetDataChannelID(testCase.role, &id, nil)
 			require.ErrorIs(t, err, ErrMaxDataChannelID)
 		})
 	}
@@ -196,15 +196,15 @@ func TestGenerateDataChannelIDReusesReleasedID(t *testing.T) {
 	}
 
 	first := new(uint16)
-	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &first))
+	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &first, nil))
 	require.Equal(t, uint16(0), *first)
 
 	exhausted := new(uint16)
-	require.ErrorIs(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &exhausted), ErrMaxDataChannelID)
+	require.ErrorIs(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &exhausted, nil), ErrMaxDataChannelID)
 
 	transport.releaseDataChannelID(*first)
 	reused := new(uint16)
-	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &reused))
+	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &reused, nil))
 	require.Equal(t, *first, *reused)
 }
 
@@ -226,7 +226,7 @@ func TestGenerateDataChannelIDRotatesBeforeReuse(t *testing.T) {
 
 			for _, expected := range testCase.expected {
 				id := new(uint16)
-				require.NoError(t, transport.generateAndSetDataChannelID(testCase.role, &id))
+				require.NoError(t, transport.generateAndSetDataChannelID(testCase.role, &id, nil))
 				require.Equal(t, expected, *id)
 				transport.releaseDataChannelID(*id)
 			}
@@ -243,11 +243,11 @@ func TestGenerateDataChannelIDRotationSkipsReservedID(t *testing.T) {
 	}
 
 	id := new(uint16)
-	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &id))
+	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &id, nil))
 	require.Equal(t, uint16(4), *id)
 	transport.releaseDataChannelID(*id)
 
-	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &id))
+	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &id, nil))
 	require.Equal(t, uint16(0), *id)
 }
 
@@ -267,7 +267,7 @@ func TestGenerateDataChannelIDRejectsEmptyRoleParity(t *testing.T) {
 			}
 
 			id := new(uint16)
-			err := transport.generateAndSetDataChannelID(testCase.role, &id)
+			err := transport.generateAndSetDataChannelID(testCase.role, &id, nil)
 			require.ErrorIs(t, err, ErrMaxDataChannelID)
 		})
 	}
@@ -318,11 +318,11 @@ func TestReleaseDataChannelIDKeepsOverlappingGenerationReserved(t *testing.T) {
 	transport.releaseDataChannelID(streamID)
 	require.Equal(t, uint32(1), transport.dataChannelIDsUsed[streamID])
 	blocked := new(uint16)
-	require.ErrorIs(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &blocked), ErrMaxDataChannelID)
+	require.ErrorIs(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &blocked, nil), ErrMaxDataChannelID)
 
 	transport.releaseDataChannelID(streamID)
 	reused := new(uint16)
-	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &reused))
+	require.NoError(t, transport.generateAndSetDataChannelID(DTLSRoleClient, &reused, nil))
 	require.Equal(t, streamID, *reused)
 }
 
@@ -333,11 +333,13 @@ func TestLocalDataChannelGenerationSurvivesDelayedReset(t *testing.T) {
 		localDataChannelGenerations: make(map[uint16][]*localDataChannelGeneration),
 	}
 
-	transport.registerLocalDataChannelGeneration(streamID)
+	first := transport.registerLocalDataChannelGeneration(streamID, nil)
 	require.True(t, transport.acceptLocalDataChannelGeneration(streamID))
-	transport.registerLocalDataChannelGeneration(streamID)
+	second := transport.registerLocalDataChannelGeneration(streamID, nil)
+	require.NotSame(t, first, second)
 
 	transport.releaseDataChannelID(streamID)
+	require.Equal(t, []*localDataChannelGeneration{second}, transport.localDataChannelGenerations[streamID])
 	require.True(t, transport.acceptLocalDataChannelGeneration(streamID))
 	require.False(t, transport.acceptLocalDataChannelGeneration(streamID))
 }
